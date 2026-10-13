@@ -1,6 +1,6 @@
 # tmpufw-modern 0.4.0
 
-A clean Python 3 successor to Josh Sherman's tmpufw concept. The original
+A clean Python 3 successor to Josh Sherman's tmpufw concept https://gitlab.com/joshtronic/tmpufw/-/blob/master/tmpufw.py?ref_type=heads. The original
 source could not be retrieved; this is an independent implementation, not
 an upstream patch. Legacy CLI flags are supported; legacy state is not imported.
 Requires Ubuntu/Debian, Python 3.10+, UFW, and systemd. No mandatory pip dependencies. Optional `sudo apt install python3-parsedatetime` enables general natural-language times.
