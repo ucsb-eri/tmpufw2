@@ -1,0 +1,11 @@
+[Unit]
+Description=Check temporary UFW rule expirations
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+Persistent=true
+AccuracySec=1s
+Unit=tmpufw-clean.service
+
+[Install]
+WantedBy=timers.target

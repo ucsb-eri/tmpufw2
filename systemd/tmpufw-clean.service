@@ -1,0 +1,8 @@
+[Unit]
+Description=Expire temporary UFW rules
+After=ufw.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tmpufw clean
+UMask=0077
