@@ -10,7 +10,11 @@ fi
 command -v systemctl >/dev/null
 install -m 0755 tmpufw.py /usr/local/sbin/tmpufw
 install -d -m 0700 /var/lib/tmpufw
-install -m 0644 systemd/tmpufw-clean.service systemd/tmpufw-clean.timer /etc/systemd/system/
+install -d -m 0755 /etc/tmpufw
+python3 configure_config.py
+install -m 0644 systemd/tmpufw-clean.service /etc/systemd/system/
+python3 configure_timer.py
 systemctl daemon-reload
 systemctl enable --now tmpufw-clean.timer
+systemctl restart tmpufw-clean.timer
 echo 'Installed. No firewall rules were changed.'

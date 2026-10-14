@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "defaults": {
+    "ttl": "30 days",
+    "position": null,
+    "legacy_position": 1,
+    "protocol": "any",
+    "direction": "in",
+    "note": ""
+  },
+  "cleanup": {
+    "schedule": "*-*-* *:*:00",
+    "accuracy_seconds": 1
+  },
+  "notifications": {
+    "version": 1,
+    "channels": {
+      "email": {
+        "enabled": false,
+        "transport": "sendmail",
+        "from": "tmpufw@localhost",
+        "to": [],
+        "sendmail_path": "/usr/sbin/sendmail",
+        "timeout_seconds": 15
+      }
+    }
+  }
+}

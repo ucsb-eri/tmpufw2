@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "channels": {
+    "email": {
+      "enabled": false,
+      "transport": "sendmail",
+      "from": "tmpufw@localhost",
+      "to": []
+    }
+  }
+}

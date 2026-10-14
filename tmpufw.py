@@ -4,6 +4,9 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+from email.message import EmailMessage
+from email.utils import formatdate
+import socket
 import ipaddress
 import json
 import os
@@ -19,10 +22,33 @@ STATE = Path('/var/lib/tmpufw')
 UFW = '/usr/sbin/ufw'
 UTC = dt.timezone.utc
 
+CONFIG = Path('/etc/tmpufw/config.json')
+
+
+def settings():
+    config = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+    if not isinstance(config, dict) or (config and config.get('version') != 1):
+        raise ValueError('Unsupported tmpufw config version')
+    defaults = config.get('defaults', {})
+    if not isinstance(defaults, dict):
+        raise ValueError('defaults must be an object')
+    for key in ('position', 'legacy_position'):
+        value = defaults.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise ValueError(key + ' must be null or a positive integer')
+    if defaults.get('protocol', 'any') not in ('any', 'tcp', 'udp'):
+        raise ValueError('Invalid default protocol')
+    if defaults.get('direction', 'in') not in ('in', 'out'):
+        raise ValueError('Invalid default direction')
+    return config
+
+
 def expiry(ttl=None, until=None):
     now = dt.datetime.now(UTC)
     if ttl is None and until is None:
-        ttl = '30d'
+        ttl = settings().get('defaults', {}).get('ttl', '30d')
+        if not isinstance(ttl, str) or not ttl:
+            raise ValueError('Default TTL must be a nonempty string')
     if ttl:
         match = re.fullmatch(r'([1-9][0-9]*)(s|m|h|d|w)', ttl)
         if match:
@@ -219,6 +245,9 @@ def raw_rule(value):
 
 
 def rule_spec(a):
+    defaults = settings().get('defaults', {})
+    a.proto = a.proto or ('any' if getattr(a, 'app', None) else defaults.get('protocol', 'any'))
+    a.direction = a.direction or defaults.get('direction', 'in')
     for value in (a.source, a.destination):
         if value != 'any':
             ipaddress.ip_network(value, strict=False)
@@ -284,7 +313,7 @@ def remove(identifier):
         run('--dry-run', '--force', 'delete', str(max(numbers)))
         run('--force', 'delete', str(max(numbers)))
 
-def save(data):
+def save(data, filename='rules.json'):
     fd, name = tempfile.mkstemp(dir=STATE, prefix='.state-')
     try:
         with os.fdopen(fd, 'w') as stream:
@@ -292,7 +321,7 @@ def save(data):
             stream.write('\n')
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(name, STATE / 'rules.json')
+        os.replace(name, STATE / filename)
         directory = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory)
@@ -310,9 +339,120 @@ def locked():
         path = STATE / 'rules.json'
         yield json.loads(path.read_text()) if path.exists() else {}
 
+NOTIFICATION_CONFIG = Path('/etc/tmpufw/notifications.json')
+LEGACY_CONFIG = Path('/etc/tmpufw.json')
+
+
+def email_settings():
+    if CONFIG.exists() or NOTIFICATION_CONFIG.exists():
+        config = settings().get('notifications', {'version': 1, 'channels': {}}) if CONFIG.exists() else json.loads(NOTIFICATION_CONFIG.read_text())
+        if not isinstance(config, dict) or config.get('version') != 1:
+            raise ValueError('Unsupported notification config version')
+        channels = config.get('channels', {})
+        if not isinstance(channels, dict):
+            raise ValueError('channels must be an object')
+        for name, channel in channels.items():
+            if not isinstance(channel, dict):
+                raise ValueError('Each notification channel must be an object')
+            if name != 'email' and channel.get('enabled', False):
+                raise ValueError('Notification channel is not implemented: ' + name)
+        email = channels.get('email', {})
+        if not isinstance(email, dict) or not isinstance(email.get('enabled', False), bool):
+            raise ValueError('email channel must contain a boolean enabled setting')
+        if email.get('transport', 'sendmail') != 'sendmail':
+            raise ValueError('Only sendmail email transport is currently implemented')
+        targets = email.get('to', []) if email.get('enabled', False) else []
+        return {'email_to': targets, 'email_from': email.get('from', 'tmpufw@localhost'),
+                'sendmail_path': email.get('sendmail_path', '/usr/sbin/sendmail'),
+                'timeout_seconds': email.get('timeout_seconds', 15)}
+    return json.loads(LEGACY_CONFIG.read_text()) if LEGACY_CONFIG.exists() else {}
+
+
+def notification_policy(a):
+    return 'disabled' if a.no_email else ('explicit' if a.email else 'configured')
+
+
+def expiration_recipients(item):
+    policy = item.get('notification_policy', 'explicit')
+    if policy == 'disabled':
+        return []
+    if policy == 'configured':
+        return recipients(argparse.Namespace(email=None, no_email=False))
+    return item.get('email_to', [])
+
+
+def email_address(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+", value):
+        raise ValueError('Use a plain email address without display names or whitespace')
+    return value
+
+
+def recipients(a):
+    config = email_settings()
+    defaults = config.get('email_to', [])
+    if not isinstance(defaults, list):
+        raise ValueError('email_to must be an array')
+    email_address(config.get('email_from', 'tmpufw@localhost'))
+    return [] if a.no_email else list(dict.fromkeys(email_address(x) for x in (a.email or defaults)))
+
+
+def outbox():
+    path = STATE / 'notifications.json'
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def queue_expiration(identifier, item):
+    if not item.get('email_to'):
+        return
+    # Deterministic event ID makes queue insertion idempotent across crash retries.
+    pending = outbox()
+    pending.setdefault(identifier, dict(item, id=identifier, host=socket.getfqdn(), attempts=0))
+    save(pending, 'notifications.json')
+
+
+def deliver_notifications():
+    pending = outbox()
+    for identifier, item in list(pending.items()):
+        try:
+            config = email_settings()
+            sender = email_address(config.get('email_from', 'tmpufw@localhost'))
+            targets = [email_address(x) for x in item['email_to']]
+            message = EmailMessage()
+            message['From'] = sender
+            message['To'] = ', '.join(targets)
+            message['Subject'] = '[tmpufw] Expiration processed on ' + item['host']
+            message['Date'] = formatdate(localtime=False)
+            message['Message-ID'] = '<tmpufw-' + identifier + '@localhost>'
+            message.set_content('Temporary UFW rule expiration cleanup completed.\n\n'
+                + 'Host: ' + item['host'] + '\nRule ID: ' + identifier
+                + '\nRule: ' + shlex.join(item['rule']) + '\nScheduled expiration: ' + item['expires']
+                + '\nCleanup completed: ' + item['removed_at']
+                + '\nOwned entries removed: ' + str(item.get('removed_entries', 0))
+                + '\nNote: ' + item.get('note', '') + '\n')
+            executable = config.get('sendmail_path', '/usr/sbin/sendmail')
+            timeout = config.get('timeout_seconds', 15)
+            if not isinstance(executable, str) or not Path(executable).is_absolute():
+                raise ValueError('sendmail_path must be absolute')
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+                raise ValueError('timeout_seconds must be positive')
+            result = subprocess.run([executable, '-i', '-f', sender, '--', *targets],
+                input=message.as_bytes(), capture_output=True, timeout=timeout,
+                env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
+            if result.returncode:
+                raise RuntimeError(result.stderr.decode(errors='replace').strip() or 'sendmail failed')
+            del pending[identifier]
+            save(pending, 'notifications.json')
+            print('notification queued to mail system', identifier)
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+            item['attempts'] += 1
+            item['last_error'] = str(error)
+            save(pending, 'notifications.json')
+            print('email retry pending', identifier, error, file=sys.stderr)
+
+
 def parser():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--version', action='version', version='tmpufw-modern 0.4.0')
+    p = argparse.ArgumentParser(description=__doc__, epilog='UFW-style: tmpufw allow 22/tcp --ttl 2h; tmpufw insert 1 deny from ADDRESS; tmpufw status; tmpufw delete ID')
+    p.add_argument('--version', action='version', version='tmpufw-modern 0.8.0')
     sub = p.add_subparsers(dest='command', required=True)
     add = sub.add_parser('add')
     add.add_argument('action', nargs='?', choices=['allow', 'deny', 'reject', 'limit'])
@@ -321,10 +461,13 @@ def parser():
     add.add_argument('-r', '--rule')
     add.add_argument('--port')
     add.add_argument('--source-port', default='any')
-    add.add_argument('--proto', choices=['any', 'tcp', 'udp'], default='any')
-    add.add_argument('--direction', choices=['in', 'out'], default='in')
+    add.add_argument('--proto', choices=['any', 'tcp', 'udp'], default=None)
+    add.add_argument('--direction', choices=['in', 'out'], default=None)
     add.add_argument('-p', '--position', type=int)
-    add.add_argument('--note', default='')
+    add.add_argument('--note', default=None)
+    add.add_argument('--email', action='append', help='Expiration recipient; repeat for multiple addresses')
+    add.add_argument('--no-email', action='store_true')
+    add.add_argument('--dry-run', action='store_true')
     add.add_argument('--app')
     add.add_argument('--interface')
     add.add_argument('--in-interface')
@@ -340,14 +483,84 @@ def parser():
     delete.add_argument('id')
     listing = sub.add_parser('list')
     listing.add_argument('--json', action='store_true')
+    listing.add_argument('--numbered', action='store_true')
     sub.add_parser('clean')
+    notify = sub.add_parser('notify')
+    notify.add_argument('id')
+    notify.add_argument('--email', action='append')
+    notify.add_argument('--no-email', action='store_true')
+    sub.add_parser('notifications')
     reconcile = sub.add_parser('reconcile')
     reconcile.add_argument('--json', action='store_true')
+    delete_rule = sub.add_parser('delete-rule', help='Delete a managed rule by specification; normally use delete')
+    delete_rule.add_argument('rule')
     return p
 
+def ufw_style(argv):
+    if not argv:
+        return argv
+    if argv[0] == 'status':
+        tail = argv[1:]
+        if tail in (['numbered'], ['verbose']):
+            tail = ['--numbered'] if tail == ['numbered'] else []
+        return ['list', *tail]
+    if argv[0] == 'delete':
+        if len(argv) == 2:
+            return ['remove', argv[1]]
+        return ['delete-rule', shlex.join(argv[1:])]
+    tokens = []
+    options = []
+    valued = {'--ttl', '-t', '--until', '--email', '--note'}
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in valued:
+            if index + 1 == len(argv):
+                raise ValueError('Missing value for ' + token)
+            options += argv[index:index + 2]
+            index += 2
+        elif any(token.startswith(name + '=') for name in valued):
+            options.append(token)
+            index += 1
+        elif token in ('--no-email', '--dry-run'):
+            options.append(token)
+            index += 1
+        else:
+            tokens.append(token)
+            index += 1
+    if not tokens:
+        return argv
+    route = tokens[0] == 'route'
+    head = 1 if route else 0
+    if len(tokens) <= head:
+        return argv
+    placement = None
+    if tokens[head] in ('insert', 'prepend'):
+        mode = tokens.pop(head)
+        if mode == 'insert':
+            if len(tokens) <= head:
+                raise ValueError('insert requires a position')
+            placement = int(tokens.pop(head))
+        else:
+            placement = 1
+    if len(tokens) <= head or tokens[head] not in ('allow', 'deny', 'reject', 'limit'):
+        return argv
+    # UFW comments become human notes; ownership comments remain tool-controlled.
+    if 'comment' in tokens:
+        i = tokens.index('comment')
+        if i != len(tokens) - 2:
+            raise ValueError('comment requires one final argument; quote multi-word notes')
+        options += ['--note', tokens[i + 1]]
+        tokens = tokens[:i]
+    translated = ['add', '--rule', shlex.join(tokens), *options]
+    if placement is not None:
+        translated += ['--position', str(placement)]
+    return translated
+
+
 def parse_args(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] not in ('add', 'extend', 'remove', 'list', 'clean', 'reconcile', '--version', '-h', '--help'):
+    argv = ufw_style(list(sys.argv[1:] if argv is None else argv))
+    if argv and argv[0] not in ('add', 'extend', 'remove', 'list', 'clean', 'reconcile', 'notify', 'notifications', 'delete-rule', '--version', '-h', '--help'):
         if argv == ['--status'] or argv == ['-s']:
             argv = ['list']
         elif argv == ['--clean'] or argv == ['-c']:
@@ -355,8 +568,13 @@ def parse_args(argv=None):
         elif any(x in ('-r', '--rule') or x.startswith('--rule=') for x in argv):
             argv = ['add', *argv]
             if not any(x in ('-p', '--position') or x.startswith('--position=') for x in argv):
-                argv += ['--position', '1']
-    return parser().parse_args(argv)
+                legacy_position = settings().get('defaults', {}).get('legacy_position', 1)
+                if legacy_position is not None:
+                    argv += ['--position', str(legacy_position)]
+    parsed = parser().parse_args(argv)
+    if parsed.command == 'add' and parsed.position is None:
+        parsed.position = settings().get('defaults', {}).get('position')
+    return parsed
 
 
 def main():
@@ -364,8 +582,34 @@ def main():
     if os.geteuid() != 0:
         raise RuntimeError('Run with sudo')
     with locked() as data:
-        if a.command in ('list', 'reconcile'):
+        if a.command == 'delete-rule':
+            args, _ = raw_rule(a.rule)
+            preview_id = uuid.uuid4().hex
+            keys = preview_keys(run('--dry-run', *args, 'comment', 'tmpufw:' + preview_id), preview_id)
+            matches = [identifier for identifier, item in data.items()
+                       if sorted(item.get('expected_keys', [])) == sorted(keys)]
+            if len(matches) != 1:
+                raise ValueError('Rule must match exactly one managed temporary rule; use its full ID')
+            a.command, a.id = 'remove', matches[0]
+        if a.command == 'remove' and a.id.isdigit():
+            number = int(a.id)
+            matches = [identifier for identifier in data if number in owned_numbers(identifier)]
+            if len(matches) != 1:
+                raise ValueError('UFW number does not belong to a managed temporary rule')
+            a.id = matches[0]
+        if a.command == 'notifications':
+            print(json.dumps(outbox(), indent=2))
+        elif a.command == 'notify':
+            if a.id not in data:
+                raise ValueError('Unknown rule ID')
+            data[a.id]['email_to'] = recipients(a)
+            data[a.id]['notification_policy'] = notification_policy(a)
+            save(data)
+            print(a.id, 'expiration recipients:', ','.join(data[a.id]['email_to']) or 'disabled')
+        elif a.command in ('list', 'reconcile'):
             report = reconciliation(data)
+            if getattr(a, 'numbered', False):
+                print(run('status', 'numbered'))
             if a.json:
                 print(json.dumps(report, indent=2))
             else:
@@ -381,21 +625,26 @@ def main():
                     any(item['health'] != ['ok'] for item in report['rules'].values())):
                 raise RuntimeError('Reconciliation found anomalies; no rules or state were changed')
         elif a.command == 'add':
+            defaults = settings().get('defaults', {})
+            a.note = a.note if a.note is not None else defaults.get('note', '')
             end = expiry(a.ttl, a.until)
+            targets = recipients(a)
             if a.rule:
-                if a.action is not None or a.port is not None or a.source != 'any' or a.destination != 'any' or a.source_port != 'any' or a.proto != 'any' or a.direction != 'in' or a.app or a.interface or a.in_interface or a.out_interface or a.route:
+                if a.action is not None or a.port is not None or a.source != 'any' or a.destination != 'any' or a.source_port != 'any' or a.proto is not None or a.direction is not None or a.app or a.interface or a.in_interface or a.out_interface or a.route:
                     raise ValueError('Do not mix --rule with structured rule arguments')
                 args, keys = raw_rule(a.rule)
             else:
                 if a.action is None:
                     raise ValueError('Specify an action or --rule')
+                a.proto = a.proto or ('any' if a.app else defaults.get('protocol', 'any'))
+                a.direction = a.direction or defaults.get('direction', 'in')
                 a.port = a.port or 'any'
                 args, keys = rule_spec(a)
             if a.position is not None and a.position < 1:
                 raise ValueError('Position must be positive')
             timer = subprocess.run(['/usr/bin/systemctl', 'is-active', '--quiet',
                                     'tmpufw-clean.timer'], check=False)
-            if timer.returncode:
+            if timer.returncode and not a.dry_run:
                 raise RuntimeError('tmpufw-clean.timer must be active before adding rules')
             if not run('status').startswith('Status: active'):
                 raise RuntimeError('UFW must already be active; tmpufw never enables it')
@@ -413,7 +662,10 @@ def main():
             keys = preview_keys(preview, identifier)
             if any(key in existing for key in keys):
                 raise RuntimeError('Equivalent UFW rule exists; refusing to take ownership')
-            data[identifier] = dict(rule=args, expires=end, status='pending', note=a.note, expected_keys=keys)
+            if a.dry_run:
+                print(json.dumps({'rule': command, 'expires': end, 'email_to': targets, 'entries': len(keys)}, indent=2))
+                return
+            data[identifier] = dict(rule=args, expires=end, status='pending', note=a.note, expected_keys=keys, email_to=targets, notification_policy=notification_policy(a))
             save(data)  # Journal before firewall mutation; pending entries are also cleaned.
             install_rule(data, identifier, command)
             print(identifier, end)
@@ -438,13 +690,37 @@ def main():
                 try:
                     if not run('status').startswith('Status: active'):
                         raise RuntimeError('UFW inactive: cleanup deferred until it is active')
-                    remove(identifier)
+                    item = data[identifier]
+                    if item['status'] == 'expired_config_pending':
+                        item['email_to'] = expiration_recipients(item)
+                        item['status'] = 'expired_email_pending'
+                        save(data)
+                    if item['status'] != 'expired_email_pending':
+                        count = len(owned_numbers(identifier))
+                        remove(identifier)
+                        if marked_records(saved_records()).get(identifier):
+                            raise RuntimeError('Owned entries remain; cleanup incomplete')
+                        if a.command == 'clean' and item['status'] != 'rollback_failed':
+                            try:
+                                item['email_to'] = expiration_recipients(item)
+                            except (ValueError, OSError) as error:
+                                item.update(status='expired_config_pending', removed_at=dt.datetime.now(UTC).isoformat(), removed_entries=count)
+                                save(data)
+                                raise RuntimeError('Firewall cleanup completed; notification configuration needs repair: ' + str(error))
+                        if a.command == 'clean' and item['status'] != 'rollback_failed' and item.get('email_to'):
+                            item.update(status='expired_email_pending', removed_at=dt.datetime.now(UTC).isoformat(),
+                                        removed_entries=count)
+                            save(data)
+                    if item['status'] == 'expired_email_pending':
+                        queue_expiration(identifier, item)
                     del data[identifier]
                     save(data)
                     print('removed', identifier)
-                except RuntimeError as error:
+                except (RuntimeError, OSError) as error:
                     print(identifier, error, file=sys.stderr)
                     failed = True
+            if a.command == 'clean':
+                deliver_notifications()
             if failed:
                 raise RuntimeError('Cleanup incomplete; retained entries will be retried')
 
